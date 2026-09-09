@@ -20,12 +20,12 @@ jobs:
 
     steps:
       - name: Check out infrastructure
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: brewly-infrastructure
 
       - name: Check out backend image source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Drogonov/brewly-backend
           path: brewly-backend
