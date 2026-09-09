@@ -1,0 +1,45 @@
+name: Validate infrastructure
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out infrastructure
+        uses: actions/checkout@v4
+        with:
+          path: brewly-infrastructure
+
+      - name: Check out backend image source
+        uses: actions/checkout@v4
+        with:
+          repository: Drogonov/brewly-backend
+          path: brewly-backend
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ansible
+        run: pip install 'ansible-core>=2.17,<2.20'
+
+      - name: Validate Ansible, Compose, and migration scripts
+        working-directory: brewly-infrastructure
+        env:
+          BREWLY_BACKEND_SOURCE: ${{ github.workspace }}/brewly-backend
+        run: ./tests/validate.sh

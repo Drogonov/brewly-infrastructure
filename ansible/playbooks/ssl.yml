@@ -1,0 +1,79 @@
+---
+- name: Issue Brewly certificates and enable HTTPS
+  hosts: backend_servers
+  become: true
+  gather_facts: false
+  force_handlers: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Resolve every TLS domain
+      ansible.builtin.command: "getent ahostsv4 {{ item }}"
+      loop: "{{ tls_domains }}"
+      register: resolved_tls_domains
+      changed_when: false
+
+    - name: Require every TLS domain to point at FirstVDS
+      ansible.builtin.assert:
+        that:
+          - public_ipv4 | string in item.stdout
+        fail_msg: "{{ item.item }} does not resolve to {{ public_ipv4 }}; HTTPS was not changed."
+      loop: "{{ resolved_tls_domains.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Issue or renew shared Let's Encrypt certificate
+      ansible.builtin.shell: >-
+        certbot certonly --non-interactive --agree-tos
+        --email {{ letsencrypt_email | quote }}
+        --webroot --webroot-path {{ letsencrypt_webroot | quote }}
+        --cert-name {{ letsencrypt_cert_name | quote }}
+        --keep-until-expiring --expand
+        -d {{ tls_domains | join(' -d ') }}
+      register: certbot_result
+      changed_when: "'Certificate not yet due for renewal' not in certbot_result.stdout"
+
+    - name: Install Brewly HTTPS nginx sites
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/etc/nginx/sites-available/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - { src: ../templates/nginx-brewly-https.conf.j2, dest: brewly.conf }
+        - { src: ../templates/nginx-grafana-https.conf.j2, dest: brewly-grafana.conf }
+        - { src: ../templates/nginx-pgadmin-https.conf.j2, dest: brewly-pgadmin.conf }
+      notify: Reload nginx
+
+    - name: Install nginx reload hook for certificate renewal
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+          /usr/sbin/nginx -t
+          /usr/bin/systemctl reload nginx
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Flush nginx reload before HTTPS check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify production HTTPS readiness
+      ansible.builtin.uri:
+        url: "https://{{ domain }}/health/ready"
+        status_code: 200
+        timeout: 10
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

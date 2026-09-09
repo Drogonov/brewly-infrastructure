@@ -1,0 +1,32 @@
+project_name: brewly
+compose_project: backend
+
+deploy_user: deploy
+deploy_root: /opt/brewly
+backend_root: "{{ deploy_root }}/backend"
+infrastructure_root: "{{ deploy_root }}/infrastructure"
+secrets_root: "{{ deploy_root }}/secrets"
+backups_root: "{{ deploy_root }}/backups"
+
+public_ipv4: 176.12.68.205
+domain: brewly.ru
+grafana_domain: grafana.brewly.ru
+pgadmin_domain: pgadmin.brewly.ru
+tls_domains:
+  - "{{ domain }}"
+  - "www.{{ domain }}"
+  - "{{ grafana_domain }}"
+  - "{{ pgadmin_domain }}"
+letsencrypt_email: support@brewly.ru
+letsencrypt_webroot: /var/www/certbot
+letsencrypt_cert_name: brewly.ru
+
+ports:
+  app: 8080
+  grafana: 3000
+  pgadmin: 5050
+
+ufw_allowed_tcp_ports:
+  - "22"
+  - "80"
+  - "443"

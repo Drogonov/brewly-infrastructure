@@ -1,0 +1,250 @@
+---
+- name: Deploy Brewly stack
+  hosts: backend_servers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+  vars:
+    infrastructure_source: "{{ playbook_dir }}/../.."
+    backend_source_from_env: "{{ lookup('ansible.builtin.env', 'BREWLY_BACKEND_SOURCE') }}"
+    backend_source: >-
+      {{ backend_source_from_env
+         if backend_source_from_env | length > 0
+         else playbook_dir + '/../../../brewly-backend' }}
+    production_env_file: "{{ lookup('ansible.builtin.env', 'BREWLY_PRODUCTION_ENV_FILE') }}"
+    database_dump_file: "{{ lookup('ansible.builtin.env', 'BREWLY_DATABASE_DUMP_FILE') }}"
+    use_remote_production_env: false
+    use_remote_database_dump: false
+    compose_file: "{{ infrastructure_root }}/compose/docker-compose-prod.yaml"
+    compose_environment:
+      BREWLY_BACKEND_ROOT: "{{ backend_root }}"
+      BREWLY_ENV_FILE: "{{ secrets_root }}/production.env"
+
+  pre_tasks:
+    - name: Require local backend checkout
+      ansible.builtin.stat:
+        path: "{{ backend_source }}/Dockerfile-prod"
+      register: local_backend_dockerfile
+      delegate_to: localhost
+      become: false
+
+    - name: Validate deployment inputs
+      ansible.builtin.assert:
+        that:
+          - local_backend_dockerfile.stat.isreg
+          - >-
+            (use_remote_production_env | bool)
+            or (production_env_file | length > 0
+                and lookup('ansible.builtin.fileglob', production_env_file) | length > 0)
+        fail_msg: A sibling brewly-backend checkout and production environment are required.
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    - name: Ensure deployment directories exist
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ backend_root }}", mode: "0755" }
+        - { path: "{{ infrastructure_root }}", mode: "0755" }
+        - { path: "{{ secrets_root }}", mode: "0700" }
+        - { path: "{{ backups_root }}", mode: "0700" }
+
+    - name: Synchronize backend source
+      ansible.posix.synchronize:
+        src: "{{ backend_source }}/"
+        dest: "{{ backend_root }}/"
+        archive: true
+        delete: true
+        rsync_opts:
+          - --exclude=.git
+          - --exclude=node_modules
+          - --exclude=dist
+          - --exclude=config/*.env
+      become: false
+
+    - name: Synchronize infrastructure source
+      ansible.posix.synchronize:
+        src: "{{ infrastructure_source }}/"
+        dest: "{{ infrastructure_root }}/"
+        archive: true
+        delete: true
+        rsync_opts:
+          - --exclude=.git
+          - --exclude=.ansible
+          - --exclude=*.env
+          - --exclude=*.dump
+      become: false
+
+    - name: Install local production environment
+      ansible.builtin.copy:
+        src: "{{ production_env_file }}"
+        dest: "{{ secrets_root }}/production.env"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+      no_log: true
+      when: not (use_remote_production_env | bool)
+
+    - name: Install production environment staged from old host
+      ansible.builtin.copy:
+        src: "{{ backups_root }}/production.env"
+        remote_src: true
+        dest: "{{ secrets_root }}/production.env"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+      no_log: true
+      when: use_remote_production_env | bool
+
+    - name: Remove legacy secret copy from backend tree
+      ansible.builtin.file:
+        path: "{{ backend_root }}/config/production.env"
+        state: absent
+      no_log: true
+
+    - name: Validate Compose configuration
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} config --quiet
+      environment: "{{ compose_environment }}"
+      changed_when: false
+
+    - name: Build backend image
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} build app
+      environment: "{{ compose_environment }}"
+      register: backend_build
+      changed_when: true
+
+    - name: Start PostgreSQL
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} up -d db-prod
+      environment: "{{ compose_environment }}"
+      changed_when: true
+
+    - name: Wait for PostgreSQL health
+      ansible.builtin.command: docker inspect --format={{ '{{' }}.State.Health.Status{{ '}}' }} brewly-postgres
+      register: postgres_health
+      retries: 30
+      delay: 2
+      until: postgres_health.stdout == 'healthy'
+      changed_when: false
+
+    - name: Copy local database dump
+      ansible.builtin.copy:
+        src: "{{ database_dump_file }}"
+        dest: "{{ backups_root }}/initial.dump"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+      when: database_dump_file | length > 0
+      no_log: true
+
+    - name: Check staged database dump
+      ansible.builtin.stat:
+        path: "{{ backups_root }}/initial.dump"
+      register: staged_database_dump
+      when: (database_dump_file | length > 0) or (use_remote_database_dump | bool)
+
+    - name: Require a non-empty staged database dump
+      ansible.builtin.assert:
+        that:
+          - staged_database_dump.stat.isreg
+          - staged_database_dump.stat.size > 0
+        fail_msg: The staged PostgreSQL dump is missing or empty.
+      when: (database_dump_file | length > 0) or (use_remote_database_dump | bool)
+
+    - name: Stop backend before replacing its database
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} stop app
+      environment: "{{ compose_environment }}"
+      changed_when: true
+      when: (database_dump_file | length > 0) or (use_remote_database_dump | bool)
+
+    - name: Recreate database for a deterministic restore
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - brewly-postgres
+          - sh
+          - -lc
+          - >-
+            dropdb --if-exists --force -U "$POSTGRES_USER" "$POSTGRES_DB"
+            && createdb -U "$POSTGRES_USER" -O "$POSTGRES_USER" "$POSTGRES_DB"
+      no_log: true
+      when: (database_dump_file | length > 0) or (use_remote_database_dump | bool)
+
+    - name: Restore staged database snapshot
+      ansible.builtin.shell: >-
+        docker exec -i brewly-postgres
+        sh -lc 'pg_restore --clean --if-exists --no-owner --no-privileges
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+        < {{ backups_root }}/initial.dump
+      when: (database_dump_file | length > 0) or (use_remote_database_dump | bool)
+      no_log: true
+
+    - name: Apply Prisma migrations as a one-off job
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} run --rm --no-deps app
+        ./node_modules/.bin/prisma migrate deploy --schema=./prisma/schema.prisma
+      environment: "{{ compose_environment }}"
+      register: prisma_migrate
+      changed_when: "'Database schema is up to date' not in prisma_migrate.stdout"
+
+    - name: Start complete Brewly stack
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} up -d --remove-orphans
+      environment: "{{ compose_environment }}"
+      changed_when: true
+
+    - name: Wait for backend readiness
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ports.app }}/health/ready"
+        status_code: 200
+        timeout: 5
+      register: backend_health
+      retries: 30
+      delay: 3
+      until: backend_health.status == 200
+
+    - name: Wait for Grafana health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ports.grafana }}/api/health"
+        status_code: 200
+        timeout: 5
+      register: grafana_health
+      retries: 20
+      delay: 3
+      until: grafana_health.status == 200
+
+    - name: Verify nginx route with production host header
+      ansible.builtin.uri:
+        url: http://127.0.0.1/health/ready
+        headers:
+          Host: "{{ domain }}"
+        status_code: 200
+        timeout: 5
+
+    - name: Show deployed containers
+      ansible.builtin.command: >-
+        docker compose --env-file {{ secrets_root }}/production.env
+        -f {{ compose_file }} ps
+      environment: "{{ compose_environment }}"
+      register: compose_ps
+      changed_when: false
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        var: compose_ps.stdout_lines

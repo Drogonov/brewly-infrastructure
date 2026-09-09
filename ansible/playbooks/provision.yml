@@ -1,0 +1,208 @@
+---
+- name: Provision Brewly host
+  hosts: backend_servers
+  become: true
+  gather_facts: true
+  force_handlers: true
+  collections:
+    - community.general
+  vars_files:
+    - ../group_vars/all.yml
+  vars:
+    harden_ssh: false
+    deploy_public_key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'BREWLY_DEPLOY_PUBLIC_KEY_FILE')) }}"
+
+  pre_tasks:
+    - name: Validate host and deployment key
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_major_version == '24'
+          - deploy_public_key | length > 40
+        fail_msg: Ubuntu 24.04 and BREWLY_DEPLOY_PUBLIC_KEY_FILE are required.
+
+  tasks:
+    - name: Install host packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - docker.io
+          - docker-compose-v2
+          - nginx
+          - certbot
+          - python3
+          - rsync
+          - ufw
+        state: present
+        update_cache: true
+
+    - name: Enable Docker and nginx
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - docker
+        - nginx
+
+    - name: Create deploy user
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        groups:
+          - docker
+          - sudo
+        append: true
+        create_home: true
+        shell: /bin/bash
+
+    - name: Create deploy SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ deploy_user }}/.ssh"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0700"
+
+    - name: Install deploy SSH key
+      ansible.builtin.copy:
+        dest: "/home/{{ deploy_user }}/.ssh/authorized_keys"
+        content: "{{ deploy_public_key }}\n"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+
+    - name: Allow deploy automation to become root
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ deploy_user }}"
+        content: "{{ deploy_user }} ALL=(root) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Create deployment directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ deploy_root }}", mode: "0755" }
+        - { path: "{{ backend_root }}", mode: "0755" }
+        - { path: "{{ infrastructure_root }}", mode: "0755" }
+        - { path: "{{ secrets_root }}", mode: "0700" }
+        - { path: "{{ backups_root }}", mode: "0700" }
+
+    - name: Configure Docker defaults
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "live-restore": true,
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+      notify: Restart Docker
+
+    - name: Create ACME webroot
+      ansible.builtin.file:
+        path: "{{ letsencrypt_webroot }}/.well-known/acme-challenge"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Install Brewly HTTP nginx sites
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/etc/nginx/sites-available/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - { src: ../templates/nginx-brewly-http.conf.j2, dest: brewly.conf }
+        - { src: ../templates/nginx-grafana-http.conf.j2, dest: brewly-grafana.conf }
+        - { src: ../templates/nginx-pgadmin-http.conf.j2, dest: brewly-pgadmin.conf }
+      notify: Reload nginx
+
+    - name: Enable Brewly nginx sites
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/{{ item }}"
+        dest: "/etc/nginx/sites-enabled/{{ item }}"
+        state: link
+      loop:
+        - brewly.conf
+        - brewly-grafana.conf
+        - brewly-pgadmin.conf
+      notify: Reload nginx
+
+    - name: Disable packaged nginx default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Allow required TCP ports before enabling firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: "{{ ufw_allowed_tcp_ports }}"
+
+    - name: Remove unused ispmanager firewall profile
+      community.general.ufw:
+        rule: allow
+        name: ispmanager
+        delete: true
+
+    - name: Enable firewall with deny-by-default ingress
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Install SSH hardening after deploy-user verification
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-brewly.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin prohibit-password
+      notify: Reload SSH
+      when: harden_ssh | bool
+
+    - name: Validate SSH configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      when: harden_ssh | bool
+
+  handlers:
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Reload SSH
+      ansible.builtin.systemd:
+        name: ssh
+        state: reloaded

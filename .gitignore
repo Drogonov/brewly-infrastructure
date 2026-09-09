@@ -1,0 +1,16 @@
+.DS_Store
+.ansible/
+*.retry
+
+# Production credentials and database snapshots never belong in git.
+*.env
+!*.env.example
+*.dump
+backups/
+secrets/
+
+# Private SSH keys are operator-owned, never repository-owned.
+ansible/keys/
+*.agekey
+key.txt
+keys.txt
